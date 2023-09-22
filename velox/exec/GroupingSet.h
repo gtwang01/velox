@@ -157,6 +157,8 @@ class GroupingSet {
   // enough to make 'input' fit.
   void ensureInputFits(const RowVectorPtr& input);
 
+  //void ensureOutputFits();
+
   // Copies the grouping keys and aggregates for 'groups' into 'result' If
   // partial output, extracts the intermediate type for aggregates, final result
   // otherwise.
@@ -195,40 +197,42 @@ class GroupingSet {
   // groups.
   void extractSpillResult(const RowVectorPtr& result);
 
+  // Returns true if spilling has triggered on this grouping set.
+  bool hasSpilled() const;
+
   // Return a list of accumulators for 'aggregates_', plus one more accumulator
   // for 'sortedAggregations_', and one for each 'distinctAggregations_'.  When
   // 'excludeToIntermediate' is true, skip the functions that support
   // 'toIntermediate'.
   std::vector<Accumulator> accumulators(bool excludeToIntermediate);
 
-  std::vector<column_index_t> keyChannels_;
-
   /// A subset of grouping keys on which the input is clustered.
   const std::vector<column_index_t> preGroupedKeyChannels_;
 
-  std::vector<std::unique_ptr<VectorHasher>> hashers_;
   const bool isGlobal_;
   const bool isPartial_;
   const bool isRawInput_;
+  const bool ignoreNullKeys_;
+  const bool isAdaptive_;
+  const uint64_t outputBufferSize_;
+
+  // The maximum memory usage that a final aggregation can hold before spilling.
+  // If it is zero, then there is no such limit.
+  const uint64_t spillMemoryThreshold_;
+  const common::SpillConfig* const spillConfig_;
+  uint32_t* const numSpillRuns_;
+  // Indicates if this grouping set and the associated hash aggregation operator
+  // is under non-reclaimable execution section or not.
+  tsan_atomic<bool>* const nonReclaimableSection_;
+
+  std::vector<std::unique_ptr<VectorHasher>> hashers_;
+  std::vector<column_index_t> keyChannels_;
 
   std::vector<AggregateInfo> aggregates_;
   AggregationMasks masks_;
   std::unique_ptr<SortedAggregations> sortedAggregations_;
   std::vector<std::unique_ptr<DistinctAggregations>> distinctAggregations_;
 
-  const bool ignoreNullKeys_;
-
-  // The maximum memory usage that a final aggregation can hold before spilling.
-  // If it is zero, then there is no such limit.
-  const uint64_t spillMemoryThreshold_;
-
-  const common::SpillConfig* const spillConfig_;
-
-  uint32_t* const numSpillRuns_;
-
-  // Indicates if this grouping set and the associated hash aggregation operator
-  // is under non-reclaimable execution section or not.
-  tsan_atomic<bool>* const nonReclaimableSection_;
 
   // Boolean indicating whether accumulators for a global aggregation (i.e.
   // aggregation with no grouping keys) have been initialized.
@@ -246,7 +250,6 @@ class GroupingSet {
   // aggregation
   HashStringAllocator stringAllocator_;
   memory::AllocationPool rows_;
-  const bool isAdaptive_;
 
   bool noMoreInput_{false};
 

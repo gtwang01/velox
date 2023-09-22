@@ -64,21 +64,25 @@ GroupingSet::GroupingSet(
       isGlobal_(hashers_.empty()),
       isPartial_(isPartial),
       isRawInput_(isRawInput),
-      aggregates_(std::move(aggregates)),
-      masks_(maskChannels(aggregates_)),
       ignoreNullKeys_(ignoreNullKeys),
+      isAdaptive_(operatorCtx->task()
+                      ->queryCtx()
+                      ->queryConfig()
+                      .hashAdaptivityEnabled()),
+      outputBufferSize_(operatorCtx->task()
+                            ->queryCtx()
+                            ->queryConfig()
+                            .preferredOutputBatchBytes()),
       spillMemoryThreshold_(operatorCtx->driverCtx()
                                 ->queryConfig()
                                 .aggregationSpillMemoryThreshold()),
       spillConfig_(spillConfig),
       numSpillRuns_(numSpillRuns),
       nonReclaimableSection_(nonReclaimableSection),
+      aggregates_(std::move(aggregates)),
+      masks_(maskChannels(aggregates_)),
       stringAllocator_(operatorCtx->pool()),
       rows_(operatorCtx->pool()),
-      isAdaptive_(operatorCtx->task()
-                      ->queryCtx()
-                      ->queryConfig()
-                      .hashAdaptivityEnabled()),
       pool_(*operatorCtx->pool()) {
   VELOX_CHECK_NOT_NULL(nonReclaimableSection_);
   VELOX_CHECK(pool_.trackUsage());
@@ -216,6 +220,18 @@ void GroupingSet::noMoreInput() {
   if (sortedAggregations_) {
     sortedAggregations_->noMoreInput();
   }
+
+  if (hasSpilled()) {
+    spiller_->spill(0, 0);
+  }
+  // Release the extra reserved memory right after processing all the inputs.
+  pool_.release();
+
+  ensureOutputFits();
+}
+
+bool GroupingSet::hasSpilled() const {
+  return spiller_ != nullptr;
 }
 
 bool GroupingSet::hasOutput() {
@@ -638,7 +654,7 @@ bool GroupingSet::getOutput(
   if (isGlobal_) {
     return getGlobalAggregationOutput(batchSize, isPartial_, iterator, result);
   }
-  if (spiller_) {
+  if (hasSpilled()) {
     return getOutputWithSpill(batchSize, result);
   }
 
@@ -737,25 +753,25 @@ const HashLookup& GroupingSet::hashLookup() const {
 void GroupingSet::ensureInputFits(const RowVectorPtr& input) {
   // Spilling is considered if this is a final or single aggregation and
   // spillPath is set.
-  if (isPartial_ || spillConfig_ == nullptr) {
+  if (spillConfig_ == nullptr) {
     return;
   }
-  auto numDistinct = table_->numDistinct();
-  if (!numDistinct) {
+  VELOX_CHECK(!isPartial_);
+
+  const auto numDistinct = table_->numDistinct();
+  if (numDistinct == 0) {
     // Table is empty. Nothing to spill.
     return;
   }
 
-  auto tableIncrement = table_->hashTableSizeIncrease(input->size());
+  const auto tableIncrement = table_->hashTableSizeIncrease(input->size());
 
-  auto rows = table_->rows();
-
+  auto* rows = table_->rows();
   auto [freeRows, outOfLineFreeBytes] = rows->freeSpace();
-  auto outOfLineBytes =
+  const auto outOfLineBytes =
       rows->stringAllocator().retainedSize() - outOfLineFreeBytes;
-  auto outOfLineBytesPerRow = outOfLineBytes / numDistinct;
-
-  int64_t flatBytes = input->estimateFlatSize();
+  const auto outOfLineBytesPerRow = outOfLineBytes / numDistinct;
+  const int64_t flatBytes = input->estimateFlatSize();
 
   // Test-only spill path.
   if (spillConfig_->testSpillPct > 0 &&
@@ -781,7 +797,8 @@ void GroupingSet::ensureInputFits(const RowVectorPtr& input) {
     return;
   }
 
-  if (!tableIncrement && freeRows > input->size() &&
+#if 0
+  if ((tableIncrement == 0) && (freeRows > input->size()) &&
       (outOfLineBytes == 0 || outOfLineFreeBytes >= flatBytes * 2)) {
     // Enough free rows for input rows and enough variable length free
     // space for double the flat size of the whole vector. If
@@ -792,6 +809,7 @@ void GroupingSet::ensureInputFits(const RowVectorPtr& input) {
     // spill protected section instead.
     return;
   }
+#endif
   // If there is variable length data we take double the flat size of
   // the input as a cap on the new variable length data needed. Same
   // condition as in first check. Completely arbitrary. Allow growth
@@ -799,19 +817,34 @@ void GroupingSet::ensureInputFits(const RowVectorPtr& input) {
   auto increment =
       rows->sizeIncrement(input->size(), outOfLineBytes ? flatBytes * 2 : 0) +
       tableIncrement;
+  const auto minGrowthBytes = currentUsage * 5 / 100;
+  const auto availableReservationBytes = pool_.availableReservation();
   // There must be at least 2x the increment in reservation.
-  if (pool_.availableReservation() > 2 * increment) {
+  if ((availableReservationBytes > 2 * increment) &&
+      (availableReservationBytes > minGrowthBytes)) {
+#if 0
+    LOG(ERROR) << pool_.name() << " skip available "
+               << succinctBytes(availableReservationBytes) << " 2*increment "
+               << succinctBytes(2 * increment) << " minGrowthBytes "
+               << succinctBytes(minGrowthBytes);
+#endif
     return;
   }
   // Check if can increase reservation. The increment is the larger of
   // twice the maximum increment from this input and
   // 'spillableReservationGrowthPct_' of the current reservation.
-  auto targetIncrement = std::max<int64_t>(
-      increment * 2,
-      currentUsage * spillConfig_->spillableReservationGrowthPct / 100);
+  auto targetIncrement =
+      std::max<int64_t>(increment * 2, currentUsage * 10 / 100);
+  const auto old = pool_.reservedBytes();
   if (pool_.maybeReserve(targetIncrement)) {
+    LOG(ERROR) << pool_.name() << " try reserve "
+               << succinctBytes(targetIncrement) << " current "
+               << succinctBytes(pool_.currentBytes()) << " reservation "
+               << succinctBytes(pool_.reservedBytes()) << " old reservation "
+               << succinctBytes(old);
     return;
   }
+  LOG(FATAL) << "Failed";
 
   // NOTE: disk spilling use the system disk spilling memory pool instead of
   // the operator memory pool.

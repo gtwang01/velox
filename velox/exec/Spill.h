@@ -603,6 +603,10 @@ class SpillState {
     return targetFileSize_;
   }
 
+  uint64_t writeBufferSize() const {
+    return writeBufferSize_;
+  }
+
   common::CompressionKind compressionKind() const {
     return compressionKind_;
   }
